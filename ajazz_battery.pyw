@@ -199,7 +199,7 @@ class AjazzBatteryApp:
             if state_key != self.last_rendered_state:
                 prev = self.last_rendered_state
                 self.last_rendered_state = state_key
-                log(f"Mudança de estado: {status['model_name']} - Bat: {status['battery']}%, Chg: {status['charging']}, Modo: {status['connection_mode']}")
+                log(f"Mudança de estado: {status['model_name']} - Bat: {status['battery']}%, Chg: {status['charging']}, Modo: {status['connection_mode']}, Src: {status.get('source')}")
                 self.refresh_icon()
 
                 # Handle alerts on state transition

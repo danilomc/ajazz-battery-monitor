@@ -221,35 +221,60 @@ def query_mouse_hid(path, timeout_ms=40):
             kernel32.CloseHandle(hReadEvent)
         kernel32.CloseHandle(hDev)
 
+_cached_driver_pid = None
+_cached_driver_base_addr = None
+_cached_driver_proc = None
+
+def get_ajazz_driver_info():
+    """
+    Returns (pid, base_addr) if Ajazz Driver is running, else (None, None).
+    Caches the process object and base address for near-instant checks.
+    """
+    global _cached_driver_pid, _cached_driver_base_addr, _cached_driver_proc
+
+    if _cached_driver_proc is not None:
+        try:
+            if _cached_driver_proc.is_running() and _cached_driver_proc.status() != psutil.STATUS_ZOMBIE:
+                return _cached_driver_pid, _cached_driver_base_addr
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        _cached_driver_pid = None
+        _cached_driver_base_addr = None
+        _cached_driver_proc = None
+
+    # Search for running Ajazz Driver process
+    try:
+        for p in psutil.process_iter(['pid', 'name']):
+            name = p.info.get('name') or ''
+            if 'ajazz' in name.lower() and name.lower().endswith('.exe'):
+                pid = p.info['pid']
+                hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+                if hSnapshot and hSnapshot != -1:
+                    try:
+                        me = MODULEENTRY32()
+                        me.dwSize = ctypes.sizeof(MODULEENTRY32)
+                        success = kernel32.Module32First(hSnapshot, ctypes.byref(me))
+                        while success:
+                            mod_name = me.szModule.decode('latin1', errors='replace').lower()
+                            if 'ajazz' in mod_name and mod_name.endswith('.exe'):
+                                _cached_driver_pid = pid
+                                _cached_driver_base_addr = me.modBaseAddr
+                                _cached_driver_proc = p
+                                return pid, me.modBaseAddr
+                            success = kernel32.Module32Next(hSnapshot, ctypes.byref(me))
+                    finally:
+                        kernel32.CloseHandle(hSnapshot)
+    except Exception:
+        pass
+
+    return None, None
+
 def query_mouse_driver_memory():
     """Query battery info from official Ajazz Driver process memory if running."""
-    pids = [p.info['pid'] for p in psutil.process_iter(['pid', 'name']) if 'ajazz' in p.info['name'].lower()]
-    if not pids:
-        return None
-    pid = pids[0]
-
-    hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
-    if hSnapshot == -1 or not hSnapshot:
+    pid, base_addr = get_ajazz_driver_info()
+    if not pid or not base_addr:
         return None
 
-    base_addr = None
-    try:
-        me = MODULEENTRY32()
-        me.dwSize = ctypes.sizeof(MODULEENTRY32)
-        success = kernel32.Module32First(hSnapshot, ctypes.byref(me))
-        while success:
-            mod_name = me.szModule.decode('latin1').lower()
-            if 'ajazz' in mod_name and mod_name.endswith('.exe'):
-                base_addr = me.modBaseAddr
-                break
-            success = kernel32.Module32Next(hSnapshot, ctypes.byref(me))
-    finally:
-        kernel32.CloseHandle(hSnapshot)
-
-    if not base_addr:
-        return None
-
-    target_addr = base_addr + 0x18963C
     handle = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
     if not handle:
         return None
@@ -262,6 +287,7 @@ def query_mouse_driver_memory():
                 return buf.raw
             return None
 
+        target_addr = base_addr + 0x18963C
         mgr_data = read_mem(target_addr, 0x40)
         if not mgr_data:
             return None
@@ -272,7 +298,7 @@ def query_mouse_driver_memory():
             return None
 
         for idx in range(num_devices):
-            ptr_data = read_mem(dev_start + idx*4, 4)
+            ptr_data = read_mem(dev_start + idx * 4, 4)
             if not ptr_data:
                 continue
             dev_ptr = struct.unpack_from('<I', ptr_data, 0)[0]
@@ -309,36 +335,46 @@ def query_mouse_driver_memory():
 def get_ajazz_mouse_status():
     """
     Primary API function to get current mouse battery status.
-    Prioritizes reading directly from Ajazz Driver memory if running (100% passive,
-    0 packets on USB/HID bus, takes <0.05ms, eliminates any popups from the official app).
-    Falls back to direct HID Overlapped I/O query if the driver is not running.
+    - If official Ajazz Driver is running: 100% passive memory reading.
+      NEVER sends any HID packets over USB/HID, eliminating 100% of driver popups.
+    - If official Ajazz Driver is NOT running: uses direct Windows HID Overlapped I/O.
     """
     global _cached_active_path
 
-    # 1. Passive Driver Memory: If official app is open, read its memory directly.
-    # This prevents any bus conflict and guarantees ZERO driver popups.
-    mem_info = query_mouse_driver_memory()
-    if mem_info and mem_info['connected']:
-        return mem_info
+    # Check if official Ajazz Driver is running
+    pid, _ = get_ajazz_driver_info()
+    if pid:
+        # Official driver is running! We MUST NOT touch HID under any circumstances.
+        mem_info = query_mouse_driver_memory()
+        if mem_info:
+            return mem_info
+        return {
+            'connected': False,
+            'model_code': '',
+            'model_name': 'Ajazz Mouse',
+            'battery': 0,
+            'charging': False,
+            'connection_mode': 'Driver em Inicialização',
+            'source': 'DriverMemory'
+        }
 
-    # 2. Fast Path: Direct HID query via cached active path
+    # If we reached here, the official driver is NOT running at all.
+    # Direct HID querying is 100% safe since there is no driver open to show popups.
+
+    # 1. Fast Path: Cached active HID path
     if _cached_active_path:
         info = query_mouse_hid(_cached_active_path, timeout_ms=30)
         if info and info['battery'] > 0:
             return info
         _cached_active_path = None
 
-    # 3. Direct HID query via path enumeration
+    # 2. Direct HID query via path enumeration
     paths = find_ajazz_hid_paths()
     for p in paths:
         info = query_mouse_hid(p, timeout_ms=50)
         if info and info['battery'] > 0:
             _cached_active_path = p
             return info
-
-    if mem_info:
-        mem_info['connected'] = False
-        return mem_info
 
     return {
         'connected': False,
