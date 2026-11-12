@@ -8,15 +8,15 @@ Um utilitário ultraleve e inteligente para Windows que exibe a **porcentagem ex
 
 ---
 
-## 🎯 Por que este projeto foi criado?
+## Por que este projeto foi criado?
 
 Os softwares oficiais da Ajazz não exibem a porcentagem numérica na bandeja do Windows nem enviam notificações nativas do sistema operacional quando a bateria está fraca ou totalmente carregada.
 
-Este monitor resolve isso com foco absoluto em **desempenho imperceptível**, **leitura em tempo real (1 segundo)** e **zero interferência** no driver oficial da fabricante.
+Este monitor resolve isso com foco absoluto em **desempenho imperceptível**, **leitura em tempo real** e **zero interferência** no driver oficial da fabricante.
 
 ---
 
-## ✨ Funcionalidades
+## Funcionalidades
 
 - **Ícone Dinâmico em Alta Resolução (DPI Aware)**:
   - Exibe o número exato da porcentagem de bateria diretamente no ícone da bandeja.
@@ -27,7 +27,7 @@ Este monitor resolve isso com foco absoluto em **desempenho imperceptível**, **
     - ⚡ **Azul Elétrico / Raio**: Carregando via cabo USB.
     - ⚪ **Cinza (?)**: Mouse em modo de repouso / desconectado.
   - Mini-barra de nível de bateria integrada ao rodapé do ícone.
-- **Detecção Instantânea (1 segundo)**:
+- **Detecção Instantânea**:
   - Detecta na hora a conexão/desconexão do cabo de carregamento USB e o retorno do modo repouso sem atrasos.
 - **Zero Interferência no Driver Oficial (Arquitetura Híbrida Inteligente)**:
   - **Modo Passivo (Prioritário)**: Quando o software oficial da Ajazz (`AJAZZ Driver (X).exe`) está em execução, o monitor lê o estado do mouse diretamente da memória do processo via `ReadProcessMemory` do Windows. **Zero pacotes enviados no barramento USB/HID**, tempo de leitura de apenas **0.02 ms** e **eliminação total de popups indesejados** na tela.
@@ -58,7 +58,7 @@ Projetado para mouses sem fio Ajazz que utilizam o ecossistema de software Ajazz
 
 ---
 
-## 📦 Instalação e Requisitos
+## Instalação e Requisitos
 
 ### Requisitos:
 - **Windows 10** ou **Windows 11** (64-bit)
