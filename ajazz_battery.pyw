@@ -27,6 +27,8 @@ LOG_FILE = os.path.join(APP_DIR, "ajazz_battery.log")
 DRIVER_EXE = r"C:\Program Files (x86)\AJAZZ\AJAZZ Driver (X)\AJAZZ Driver (X).exe"
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REG_APP_NAME = "AjazzBatteryMonitor"
+LOCAL_AUTOSTART_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AjazzBatteryMonitor")
+LOCAL_AUTOSTART_VBS = os.path.join(LOCAL_AUTOSTART_DIR, "autostart.vbs")
 
 def log(msg):
     try:
@@ -79,7 +81,29 @@ def set_autostart(enable=True):
                 if not os.path.exists(pythonw_exe):
                     pythonw_exe = sys.executable
                 script_path = os.path.abspath(__file__)
-                cmd = f'"{pythonw_exe}" "{script_path}"'
+                work_dir = os.path.dirname(script_path)
+
+                os.makedirs(LOCAL_AUTOSTART_DIR, exist_ok=True)
+                vbs_content = (
+                    'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+                    'Set WshShell = CreateObject("WScript.Shell")\r\n'
+                    f'scriptPath = "{script_path}"\r\n'
+                    f'pythonwExe = "{pythonw_exe}"\r\n'
+                    f'workDir = "{work_dir}"\r\n'
+                    'Dim i\r\n'
+                    'For i = 1 To 45\r\n'
+                    '    If fso.FileExists(scriptPath) Then Exit For\r\n'
+                    '    WScript.Sleep 2000\r\n'
+                    'Next\r\n'
+                    'If fso.FileExists(scriptPath) Then\r\n'
+                    '    WshShell.CurrentDirectory = workDir\r\n'
+                    '    WshShell.Run Chr(34) & pythonwExe & Chr(34) & " " & Chr(34) & scriptPath & Chr(34), 0, False\r\n'
+                    'End If\r\n'
+                )
+                with open(LOCAL_AUTOSTART_VBS, "w", encoding="utf-16") as f:
+                    f.write(vbs_content)
+
+                cmd = f'wscript.exe "{LOCAL_AUTOSTART_VBS}"'
                 winreg.SetValueEx(key, REG_APP_NAME, 0, winreg.REG_SZ, cmd)
                 log(f"Autostart registrado: {cmd}")
             else:
@@ -88,6 +112,11 @@ def set_autostart(enable=True):
                     log("Autostart removido")
                 except FileNotFoundError:
                     pass
+                if os.path.exists(LOCAL_AUTOSTART_VBS):
+                    try:
+                        os.remove(LOCAL_AUTOSTART_VBS)
+                    except OSError:
+                        pass
         return True
     except Exception as e:
         log(f"Erro ao configurar inicialização: {e}")
