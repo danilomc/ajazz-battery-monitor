@@ -8,6 +8,8 @@ import os
 import sys
 import time
 import json
+import ctypes
+from ctypes import wintypes
 import threading
 import winreg
 from datetime import datetime
@@ -18,7 +20,7 @@ import psutil
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
-from ajazz_mouse import get_ajazz_mouse_status
+from ajazz_mouse import get_ajazz_mouse_status, invalidate_hid_cache
 
 # Paths
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,9 +40,9 @@ def log(msg):
     except Exception:
         pass
 
-# Default configuration: 1 second interval for instant plug/unplug detection
+# Default configuration: 15s HID polling + instant USB change events for minimal bus load
 DEFAULT_CONFIG = {
-    "update_interval_sec": 1,
+    "update_interval_sec": 15,
     "notify_low_battery": True,
     "notify_full_charge": True
 }
@@ -198,21 +200,26 @@ class AjazzBatteryApp:
         self.running = True
         self.icon = None
         self.last_rendered_state = None
+        self.wake_event = threading.Event()
+        self._usb_changed = False
+        self._watcher_hwnd = None
+        self._wndproc_ref = None
         self.current_status = {
             'connected': False,
             'model_name': 'Ajazz Mouse',
             'battery': 0,
             'charging': False,
             'connection_mode': 'Inicializando...',
+            'source': 'None',
             'last_update': 'Nunca'
         }
         self.warned_20 = False
         self.warned_10 = False
         self.warned_full = False
 
-    def update_status(self):
+    def update_status(self, force_reenum=False):
         try:
-            status = get_ajazz_mouse_status()
+            status = get_ajazz_mouse_status(force_reenum=force_reenum)
             now_str = datetime.now().strftime("%H:%M:%S")
             status['last_update'] = now_str
             self.current_status = status
@@ -301,18 +308,130 @@ class AjazzBatteryApp:
         except Exception as e:
             log(f"Erro em notify: {e}")
 
+    def _start_usb_watcher(self):
+        t = threading.Thread(target=self._usb_watcher_loop, daemon=True)
+        t.start()
+
+    def _usb_watcher_loop(self):
+        """Listen passively to Windows WM_DEVICECHANGE to detect cable plug/unplug instantly."""
+        WM_DESTROY = 0x0002
+        WM_CLOSE = 0x0010
+        WM_DEVICECHANGE = 0x0219
+        DBT_DEVNODES_CHANGED = 0x0007
+
+        user32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ('style', wintypes.UINT),
+                ('lpfnWndProc', WNDPROC),
+                ('cbClsExtra', ctypes.c_int),
+                ('cbWndExtra', ctypes.c_int),
+                ('hInstance', wintypes.HINSTANCE),
+                ('hIcon', wintypes.HANDLE),
+                ('hCursor', wintypes.HANDLE),
+                ('hbrBackground', wintypes.HANDLE),
+                ('lpszMenuName', wintypes.LPCWSTR),
+                ('lpszClassName', wintypes.LPCWSTR),
+            ]
+
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.PostQuitMessage.restype = None
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            if msg == WM_DEVICECHANGE and wparam == DBT_DEVNODES_CHANGED:
+                self._usb_changed = True
+                self.wake_event.set()
+            elif msg == WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            elif msg == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        try:
+            self._wndproc_ref = WNDPROC(wndproc)
+            h_inst = k32.GetModuleHandleW(None)
+            class_name = f"AjazzUsbWatcher_{os.getpid()}"
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = self._wndproc_ref
+            wc.hInstance = h_inst
+            wc.lpszClassName = class_name
+            user32.RegisterClassW(ctypes.byref(wc))
+
+            hwnd = user32.CreateWindowExW(
+                0, class_name, "AjazzUsbWatcher", 0,
+                0, 0, 0, 0, None, None, h_inst, None
+            )
+            if not hwnd:
+                log("Aviso: não foi possível criar janela watcher USB.")
+                return
+            self._watcher_hwnd = hwnd
+            log("Watcher de eventos USB iniciado.")
+
+            msg = wintypes.MSG()
+            while self.running:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            log(f"Erro no watcher USB: {e}")
+
     def background_loop(self):
-        log("Thread de atualização iniciada (frequência: 1s).")
+        log("Thread de atualização iniciada (15s HID / evento USB instantâneo).")
+        self.update_status(force_reenum=True)
         while self.running:
-            self.update_status()
-            # Fast 1s polling with virtually zero overhead (~1.5ms active per second)
-            interval = self.config.get("update_interval_sec", 1)
-            time.sleep(interval)
+            cfg_interval = self.config.get("update_interval_sec", 15)
+            if self.current_status.get('source') == 'DriverMemory':
+                interval = max(2, min(5, cfg_interval))
+            else:
+                interval = max(10, cfg_interval)
+
+            woken = self.wake_event.wait(timeout=interval)
+            if not self.running:
+                break
+
+            if woken and self._usb_changed:
+                self.wake_event.clear()
+                self._usb_changed = False
+                time.sleep(0.8)  # Debounce USB PnP enumeration
+                invalidate_hid_cache()
+                self.update_status(force_reenum=True)
+            else:
+                self.wake_event.clear()
+                self.update_status(force_reenum=False)
         log("Thread de atualização encerrada.")
 
     def on_refresh(self, icon=None, item=None):
         self.last_rendered_state = None  # Force re-render
-        self.update_status()
+        self.update_status(force_reenum=True)
         st = self.current_status
         if st['connected']:
             chg = " (Carregando ⚡)" if st['charging'] else ""
@@ -349,6 +468,12 @@ class AjazzBatteryApp:
     def on_exit(self, icon=None, item=None):
         log("Saindo do monitor de bateria...")
         self.running = False
+        self.wake_event.set()
+        if self._watcher_hwnd:
+            try:
+                ctypes.windll.user32.PostMessageW(self._watcher_hwnd, 0x0010, 0, 0)
+            except Exception:
+                pass
         if self.icon:
             self.icon.stop()
 
@@ -409,6 +534,7 @@ class AjazzBatteryApp:
         def on_tray_ready(icon):
             icon.visible = True
             log("Ícone visível na bandeja do sistema.")
+            self._start_usb_watcher()
             t = threading.Thread(target=self.background_loop, daemon=True)
             t.start()
 
@@ -420,6 +546,6 @@ class AjazzBatteryApp:
             log("Aplicação finalizada.")
 
 if __name__ == '__main__':
-    log("=== Iniciando Ajazz Battery Monitor (1s polling) ===")
+    log("=== Iniciando Ajazz Battery Monitor (15s HID / evento USB instantâneo) ===")
     app = AjazzBatteryApp()
     app.run()

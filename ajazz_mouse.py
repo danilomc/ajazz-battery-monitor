@@ -6,6 +6,7 @@ Robust non-blocking HID communication with timeout, path caching, and driver pro
 import ctypes
 from ctypes import wintypes
 import struct
+import time
 import psutil
 
 # Windows API Constants
@@ -17,6 +18,7 @@ OPEN_EXISTING = 3
 FILE_FLAG_OVERLAPPED = 0x40000000
 WAIT_OBJECT_0 = 0
 ERROR_IO_PENDING = 997
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -30,10 +32,37 @@ setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
 setupapi.SetupDiEnumDeviceInterfaces.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
 setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
 setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
 setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 
 hid = ctypes.windll.hid
 kernel32 = ctypes.windll.kernel32
+kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+kernel32.WriteFile.restype = wintypes.BOOL
+kernel32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+kernel32.ReadFile.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+kernel32.GetOverlappedResult.restype = wintypes.BOOL
+kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+kernel32.CancelIoEx.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.Module32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+kernel32.Module32First.restype = wintypes.BOOL
+kernel32.Module32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+kernel32.Module32Next.restype = wintypes.BOOL
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+kernel32.ReadProcessMemory.restype = wintypes.BOOL
 
 class GUID(ctypes.Structure):
     _fields_ = [
@@ -88,7 +117,15 @@ MODEL_MAP = {
     'M184': 'Ajazz AJ179',
 }
 
+ALLOWED_AJAZZ_PIDS = ('pid_5c2e', 'pid_5c2f', 'pid_5d2e', 'pid_5e2e', 'pid_5b2e', 'pid_5b2f')
 _cached_active_path = None
+_last_hid_enum_ts = 0.0
+
+def invalidate_hid_cache():
+    """Reset cached HID path and enumeration throttle (e.g., on USB device change)."""
+    global _cached_active_path, _last_hid_enum_ts
+    _cached_active_path = None
+    _last_hid_enum_ts = 0.0
 
 def format_model_name(code):
     clean = code.strip().upper()
@@ -98,11 +135,11 @@ def format_model_name(code):
     return f"Ajazz ({clean})" if clean else "Ajazz Mouse"
 
 def find_ajazz_hid_paths():
-    """Enumerate all HID device paths matching Ajazz VIDs and MI_02 interface."""
+    """Enumerate all HID device paths matching Ajazz VIDs, known PIDs, and MI_02 interface."""
     hid_guid = GUID()
     hid.HidD_GetHidGuid(ctypes.byref(hid_guid))
     hDevInfo = setupapi.SetupDiGetClassDevsW(ctypes.byref(hid_guid), None, None, 0x12)
-    if hDevInfo == -1 or not hDevInfo:
+    if not hDevInfo or hDevInfo == INVALID_HANDLE_VALUE:
         return []
 
     paths = []
@@ -124,14 +161,14 @@ def find_ajazz_hid_paths():
                 if setupapi.SetupDiGetDeviceInterfaceDetailW(hDevInfo, ctypes.byref(did), buf, req_size.value, None, None):
                     path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
                     plow = path.lower()
-                    if ('vid_248a' in plow or 'vid_249a' in plow) and 'mi_02' in plow:
+                    if ('vid_248a' in plow or 'vid_249a' in plow) and any(pid in plow for pid in ALLOWED_AJAZZ_PIDS) and 'mi_02' in plow:
                         paths.append(path)
     finally:
         setupapi.SetupDiDestroyDeviceInfoList(hDevInfo)
     return paths
 
 def query_mouse_hid(path, timeout_ms=40):
-    """Query mouse using non-blocking Overlapped I/O with timeout."""
+    """Query mouse using non-blocking Overlapped I/O with safe cancellation and strict packet validation."""
     hDev = kernel32.CreateFileW(
         path,
         GENERIC_READ | GENERIC_WRITE,
@@ -141,11 +178,18 @@ def query_mouse_hid(path, timeout_ms=40):
         FILE_FLAG_OVERLAPPED,
         None
     )
-    if hDev == -1 or not hDev:
+    if not hDev or hDev == INVALID_HANDLE_VALUE:
         return None
 
     hWriteEvent = kernel32.CreateEventW(None, True, False, None)
     hReadEvent = kernel32.CreateEventW(None, True, False, None)
+    if not hWriteEvent or not hReadEvent:
+        if hWriteEvent:
+            kernel32.CloseHandle(hWriteEvent)
+        if hReadEvent:
+            kernel32.CloseHandle(hReadEvent)
+        kernel32.CloseHandle(hDev)
+        return None
 
     try:
         # 33-byte query packet: byte 0 = 0x00, byte 1 = 0x10
@@ -162,9 +206,11 @@ def query_mouse_hid(path, timeout_ms=40):
             err = kernel32.GetLastError()
             if err == ERROR_IO_PENDING:
                 if kernel32.WaitForSingleObject(hWriteEvent, timeout_ms) == WAIT_OBJECT_0:
-                    kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_write), ctypes.byref(written), False)
+                    if not kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_write), ctypes.byref(written), False):
+                        return None
                 else:
-                    kernel32.CancelIo(hDev)
+                    kernel32.CancelIoEx(hDev, ctypes.byref(ov_write))
+                    kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_write), ctypes.byref(written), True)
                     return None
             else:
                 return None
@@ -181,10 +227,11 @@ def query_mouse_hid(path, timeout_ms=40):
             err = kernel32.GetLastError()
             if err == ERROR_IO_PENDING:
                 if kernel32.WaitForSingleObject(hReadEvent, timeout_ms) == WAIT_OBJECT_0:
-                    kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_read), ctypes.byref(bytes_read), False)
-                    got_data = True
+                    if kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_read), ctypes.byref(bytes_read), False):
+                        got_data = True
                 else:
-                    kernel32.CancelIo(hDev)
+                    kernel32.CancelIoEx(hDev, ctypes.byref(ov_read))
+                    kernel32.GetOverlappedResult(hDev, ctypes.byref(ov_read), ctypes.byref(bytes_read), True)
                     return None
             else:
                 return None
@@ -194,14 +241,16 @@ def query_mouse_hid(path, timeout_ms=40):
         if not got_data or bytes_read.value != 33:
             return None
 
+        # Validate response header & telemetry bounds to reject unrelated/corrupt reports
+        if read_buf[1] != 0x10 or read_buf[13] not in (0, 1) or not (0 <= read_buf[14] <= 100):
+            return None
+
         model_code = read_buf[5:10].decode('ascii', errors='ignore').rstrip('\x00')
         charging = bool(read_buf[13])
         battery = int(read_buf[14])
 
-        if battery > 100:
-            battery = 100
-
-        is_wireless = ('pid_5c2f' in path.lower() or 'vid_249a' in path.lower())
+        plow = path.lower()
+        is_wireless = ('pid_5c2f' in plow or 'pid_5b2f' in plow or 'vid_249a' in plow)
 
         return {
             'connected': True,
@@ -215,22 +264,21 @@ def query_mouse_hid(path, timeout_ms=40):
     except Exception:
         return None
     finally:
-        if hWriteEvent:
-            kernel32.CloseHandle(hWriteEvent)
-        if hReadEvent:
-            kernel32.CloseHandle(hReadEvent)
+        kernel32.CloseHandle(hWriteEvent)
+        kernel32.CloseHandle(hReadEvent)
         kernel32.CloseHandle(hDev)
 
 _cached_driver_pid = None
 _cached_driver_base_addr = None
 _cached_driver_proc = None
+_last_driver_scan_ts = 0.0
 
 def get_ajazz_driver_info():
     """
     Returns (pid, base_addr) if Ajazz Driver is running, else (None, None).
-    Caches the process object and base address for near-instant checks.
+    Caches the process object and base address and throttles full process scans to 15s.
     """
-    global _cached_driver_pid, _cached_driver_base_addr, _cached_driver_proc
+    global _cached_driver_pid, _cached_driver_base_addr, _cached_driver_proc, _last_driver_scan_ts
 
     if _cached_driver_proc is not None:
         try:
@@ -242,6 +290,11 @@ def get_ajazz_driver_info():
         _cached_driver_base_addr = None
         _cached_driver_proc = None
 
+    now = time.monotonic()
+    if now - _last_driver_scan_ts < 15.0:
+        return None, None
+    _last_driver_scan_ts = now
+
     # Search for running Ajazz Driver process
     try:
         for p in psutil.process_iter(['pid', 'name']):
@@ -249,7 +302,7 @@ def get_ajazz_driver_info():
             if 'ajazz' in name.lower() and name.lower().endswith('.exe'):
                 pid = p.info['pid']
                 hSnapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
-                if hSnapshot and hSnapshot != -1:
+                if hSnapshot and hSnapshot != INVALID_HANDLE_VALUE:
                     try:
                         me = MODULEENTRY32()
                         me.dwSize = ctypes.sizeof(MODULEENTRY32)
@@ -332,14 +385,14 @@ def query_mouse_driver_memory():
         kernel32.CloseHandle(handle)
     return None
 
-def get_ajazz_mouse_status():
+def get_ajazz_mouse_status(force_reenum=False):
     """
     Primary API function to get current mouse battery status.
     - If official Ajazz Driver is running: 100% passive memory reading.
       NEVER sends any HID packets over USB/HID, eliminating 100% of driver popups.
     - If official Ajazz Driver is NOT running: uses direct Windows HID Overlapped I/O.
     """
-    global _cached_active_path
+    global _cached_active_path, _last_hid_enum_ts
 
     # Check if official Ajazz Driver is running
     pid, _ = get_ajazz_driver_info()
@@ -360,21 +413,26 @@ def get_ajazz_mouse_status():
 
     # If we reached here, the official driver is NOT running at all.
     # Direct HID querying is 100% safe since there is no driver open to show popups.
+    if force_reenum:
+        invalidate_hid_cache()
 
     # 1. Fast Path: Cached active HID path
     if _cached_active_path:
-        info = query_mouse_hid(_cached_active_path, timeout_ms=30)
+        info = query_mouse_hid(_cached_active_path, timeout_ms=50)
         if info and info['battery'] > 0:
             return info
         _cached_active_path = None
 
-    # 2. Direct HID query via path enumeration
-    paths = find_ajazz_hid_paths()
-    for p in paths:
-        info = query_mouse_hid(p, timeout_ms=50)
-        if info and info['battery'] > 0:
-            _cached_active_path = p
-            return info
+    # 2. Throttled HID path enumeration (at most every 15s unless forced)
+    now = time.monotonic()
+    if force_reenum or (now - _last_hid_enum_ts >= 15.0):
+        _last_hid_enum_ts = now
+        paths = find_ajazz_hid_paths()
+        for p in paths:
+            info = query_mouse_hid(p, timeout_ms=50)
+            if info and info['battery'] > 0:
+                _cached_active_path = p
+                return info
 
     return {
         'connected': False,
